@@ -1,0 +1,10 @@
+[project]
+name = "yourco-mcp"
+version = "0.1.0"
+description = "MCP SDK wired to the Tool Registry: live metadata, default auth, stateless HTTP"
+requires-python = ">=3.9"
+dependencies = ["httpx>=0.27", "jsonschema>=4.21", "starlette>=0.37"]
+
+[project.optional-dependencies]
+redis = ["redis>=5"]
+server = ["uvicorn>=0.29"]
