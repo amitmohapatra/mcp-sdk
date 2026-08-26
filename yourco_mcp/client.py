@@ -53,21 +53,34 @@ class RegistryClient:
 
     SUPPORTED_CONTRACTS = {"v1"}
 
+    async def fetch_if_changed(self, current_seq: int) -> Optional[dict]:
+        """Cheap conditional poll: None if the registry is still at current_seq
+        (HTTP 304 — no body transferred), else the fresh manifest."""
+        async with self._http() as client:
+            r = await client.get(f"/v1/products/{self.product_key}/manifest",
+                                 headers={"If-None-Match": f'W/"{current_seq}"'})
+        if r.status_code == 304:
+            return None
+        if r.status_code != 200:
+            raise RegistryError(f"manifest poll failed: HTTP {r.status_code}")
+        return self._validated(r.json())
+
+    def _validated(self, manifest: dict) -> dict:
+        contract = manifest.get("contract", "v1")
+        if contract not in self.SUPPORTED_CONTRACTS:
+            raise RegistryError(
+                f"registry speaks contract '{contract}' but this SDK supports "
+                f"{sorted(self.SUPPORTED_CONTRACTS)} — upgrade yourco-mcp")
+        self.save_snapshot(manifest)
+        return manifest
+
     async def fetch_manifest(self) -> dict:
         async with self._http() as client:
             r = await client.get(f"/v1/products/{self.product_key}/manifest")
             if r.status_code != 200:
                 raise RegistryError(f"manifest fetch failed: HTTP {r.status_code}")
             manifest = r.json()
-        contract = manifest.get("contract", "v1")
-        if contract not in self.SUPPORTED_CONTRACTS:
-            # refuse cleanly rather than mis-parse: callers fall back to the
-            # snapshot / last-known-good manifest and keep serving
-            raise RegistryError(
-                f"registry speaks contract '{contract}' but this SDK supports "
-                f"{sorted(self.SUPPORTED_CONTRACTS)} — upgrade yourco-mcp")
-        self.save_snapshot(manifest)
-        return manifest
+        return self._validated(manifest)
 
     async def fetch_or_snapshot(self) -> dict:
         """Registry down != product down: fall back to last-known-good."""

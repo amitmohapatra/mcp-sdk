@@ -148,17 +148,29 @@ class ProductServer:
                         "it will not be served", name)
 
     async def _listen(self) -> None:
+        """Push-first, poll-fallback. While the subscription is healthy, events
+        drive updates. When it drops, we back off exponentially (2s -> 60s cap)
+        and CHEAP-POLL the manifest (ETag/304 — near-zero cost when unchanged)
+        on each retry, so updates keep flowing even through a long pub/sub
+        outage. The moment the subscription reconnects, backoff resets."""
+        failures = 0
         while True:
             try:
                 async for event in self.client.subscribe(self._compiled.raw):
+                    failures = 0                      # healthy again
                     await self.handle_event(event)
             except asyncio.CancelledError:
                 return
             except Exception as exc:
-                log.warning("subscription dropped (%s); retrying in 2s", exc)
-                await asyncio.sleep(2)
+                failures += 1
+                delay = min(2 ** failures, 60)
+                log.warning("subscription down (%s); polling fallback, retry in %ss",
+                            exc, delay)
+                await asyncio.sleep(delay)
                 with contextlib.suppress(Exception):
-                    await self._refetch()
+                    fresh = await self.client.fetch_if_changed(self._compiled.seq)
+                    if fresh is not None:
+                        self._swap(_CompiledManifest(fresh))
 
     async def handle_event(self, event: dict) -> None:
         current = self._compiled

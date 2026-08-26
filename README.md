@@ -193,6 +193,9 @@ async def charge_card(ctx, card_id: str, amount: float, currency: str = "USD"):
 - **Cold start while registry is down** → served from a last-known-good snapshot
   the SDK maintains automatically (cached under `~/.cache/yourco-mcp/`; override
   the location with `YOURCO_MCP_CACHE_DIR` if your runtime needs it).
+- **Pub/sub outage** → automatic fallback to cheap conditional polling
+  (ETag/304) with exponential backoff, while continuously trying to
+  re-subscribe — updates keep flowing, just seconds slower.
 - **Bad/malformed update** → logged, ignored, re-synced; a good manifest is never
   replaced by a broken one.
 - **Stateless HTTP** → run N replicas behind any load balancer; no sticky sessions.

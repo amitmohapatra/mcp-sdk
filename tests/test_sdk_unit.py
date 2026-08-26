@@ -2,6 +2,7 @@
 (manifest compile, event application, seq re-sync, audience entitlement,
 argument preparation, auth policies) verified against fixture data."""
 import asyncio
+import contextlib
 import json
 
 import pytest
@@ -198,4 +199,56 @@ def test_code_declared_scopes_union_with_registry():
         assert r["error"]["code"] == -32003      # has code scope, missing registry scope
         r = await call("full")
         assert "error" not in r                  # union satisfied
+    asyncio.get_event_loop().run_until_complete(run())
+
+
+def test_pubsub_failure_falls_back_to_polling():
+    """Subscription permanently down -> updates still arrive via conditional polls."""
+    import httpx
+    from yourco_mcp.client import RegistryClient
+
+    updated = json.loads(json.dumps(MANIFEST))
+    updated["seq"] = 2
+    updated["entities"][0]["views"]["external"]["spec"]["description"] = "POLLED UPDATE"
+
+    class Poll304Then200(httpx.AsyncBaseTransport):
+        calls = 0
+        async def handle_async_request(self, request):
+            Poll304Then200.calls += 1
+            if Poll304Then200.calls == 1:
+                return httpx.Response(304)                 # nothing new yet
+            return httpx.Response(200, json=updated)       # then a change lands
+
+    client = RegistryClient("http://x", "billing", "k", transport=Poll304Then200())
+
+    async def dead_subscription(manifest):
+        raise ConnectionError("redis down")
+        yield  # pragma: no cover
+
+    client.subscribe = dead_subscription
+    s = ProductServer("http://x", "billing", "k", auth=NoAuth(), client=client)
+    s._swap(_CompiledManifest(MANIFEST))
+
+    @s.tool("get_invoice")
+    async def gi(ctx, invoice_id, max_results=100): return {}
+
+    async def run():
+        import yourco_mcp.server as srv
+        real_sleep = asyncio.sleep
+        srv.asyncio.sleep = lambda *_: real_sleep(0)       # fast-forward backoff
+        task = asyncio.get_event_loop().create_task(s._listen())
+        try:
+            for _ in range(200):
+                await real_sleep(0.01)
+                if s._compiled.seq == 2:
+                    break
+            assert s._compiled.seq == 2                    # update arrived WITHOUT pub/sub
+            tools = (await s.handle_request(
+                {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, {}))["result"]["tools"]
+            assert tools[0]["description"] == "POLLED UPDATE"
+        finally:
+            srv.asyncio.sleep = real_sleep
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
     asyncio.get_event_loop().run_until_complete(run())
