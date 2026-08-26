@@ -17,4 +17,4 @@ from .server import ProductServer, ToolContext
 __all__ = ["ProductServer", "ToolContext", "RegistryClient", "RegistryError",
            "AuthUser", "AuthProvider", "AuthPolicy", "DefaultPolicy", "AllGatedPolicy",
            "NoAuth", "ApiKeyAuthProvider", "StaticTokenProvider"]
-__version__ = "0.1.0"
+__version__ = "0.2.0"

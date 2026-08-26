@@ -73,6 +73,25 @@ A plain `async def fn(headers) -> AuthUser | None` works too. Built-ins:
 `NoAuth()` — the **explicit** opt-out for genuinely open servers (nothing is ever
 open by accident).
 
+**Per-tool choice is yours.** By default every `tools/call` requires an
+authenticated caller — but you can open specific tools, and gate `tools/list`,
+per your product's needs:
+
+```python
+@server.tool("ping", public=True)          # this tool executes without auth
+async def ping(ctx): ...
+
+@server.tool("refund_payment")             # this one stays gated (default)
+async def refund(ctx, payment_id: str): ...
+
+# and tools/list itself: open by default; gate it if tool names are sensitive
+server = ProductServer(..., policy=AllGatedPolicy())
+```
+
+Safety rule: if an admin attaches `required_scopes` to a tool in the registry,
+auth is required again **even if the code marks it public** — the runtime
+tightening always wins, the code-side opt-out can never override it.
+
 Once your verifier exists, the SDK enforces — you write none of this:
 
 | Layer | Behavior | You configure it… |

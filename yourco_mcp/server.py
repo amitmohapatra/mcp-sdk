@@ -88,6 +88,7 @@ class ProductServer:
                                                snapshot_path=snapshot_path)
         self.product_key = product_key
         self._handlers: Dict[str, Callable] = {}
+        self._public_tools: set = set()
         self._authorize_hook: Optional[Callable] = None
         if callable(auth) and not isinstance(auth, AuthProvider):
             auth = CallableProvider(auth)
@@ -98,9 +99,15 @@ class ProductServer:
 
     # ---- registration API ----
 
-    def tool(self, name: str):
+    def tool(self, name: str, public: bool = False):
+        """Register a handler. public=True lets THIS tool execute without
+        authentication even when the policy gates tools/call — the product
+        team's per-tool choice. Registry-set required_scopes still win:
+        if an admin attaches scopes to a public tool, auth is required again."""
         def register(fn):
             self._handlers[name] = fn
+            if public:
+                self._public_tools.add(name)
             return fn
         return register
 
@@ -192,8 +199,9 @@ class ProductServer:
         user: Optional[AuthUser] = None
         if self.auth is not None:
             user = await self.auth.authenticate(headers)
-        if self.policy.requires_auth(method) and user is None:
+        if self.policy.requires_auth(method) and user is None and method != "tools/call":
             return _error(rid, MCP_UNAUTHORIZED, "Unauthorized")
+        # tools/call is gated per tool inside _call_tool (public tools may opt out)
         audience = self.resolve_audience(headers, user)
         try:
             if method == "initialize":
@@ -234,8 +242,14 @@ class ProductServer:
         if view is None or name not in self._handlers:
             raise _McpFailure(JSONRPC_METHOD_NOT_FOUND, f"Unknown or disabled tool: {name}")
         required_scopes = (view["spec"].get("auth") or {}).get("required_scopes", [])
-        if required_scopes and (user is None or not scope_satisfied(user, required_scopes)):
-            raise _McpFailure(MCP_FORBIDDEN, "Missing required scope")
+        if required_scopes:
+            # admin-set scopes always require auth — even on a code-public tool
+            if user is None or not scope_satisfied(user, required_scopes):
+                raise _McpFailure(MCP_FORBIDDEN if user else MCP_UNAUTHORIZED,
+                                  "Missing required scope" if user else "Unauthorized")
+        elif user is None and self.policy.requires_auth("tools/call") \
+                and name not in self._public_tools:
+            raise _McpFailure(MCP_UNAUTHORIZED, "Unauthorized")
         args = self._prepare_args(view, audience, name, raw_args)
         if self._authorize_hook and not await self._authorize_hook(user, name, args):
             raise _McpFailure(MCP_FORBIDDEN, "Not authorized for this call")

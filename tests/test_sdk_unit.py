@@ -113,3 +113,46 @@ def test_rpc_roundtrip_from_fixture_manifest():
                                                "arguments": {"invoice_id": "i9"}}}, {})
         assert json.loads(r["result"]["content"][0]["text"])["max_results"] == 25
     asyncio.get_event_loop().run_until_complete(run())
+
+
+def test_per_tool_public_execution():
+    """Product teams choose per tool: public tools execute anonymously while
+    others stay gated; registry-set scopes re-gate even a public tool."""
+    from yourco_mcp.auth import StaticTokenProvider
+    s = ProductServer("http://x", "billing", "key",
+                      auth=StaticTokenProvider({"t": {"id": "u", "scopes": []}}))
+    m = json.loads(json.dumps(MANIFEST))
+    m["entities"].append({"id": "e2", "type": "tool", "name": "ping_public", "version": 1,
+        "views": {"external": {"enabled": True, "pins": {},
+                  "spec": {"name": "ping_public", "description": "Public ping.",
+                           "input_schema": {"type": "object", "properties": {}}}}}})
+    m["entities"].append({"id": "e3", "type": "tool", "name": "locked_public", "version": 1,
+        "views": {"external": {"enabled": True, "pins": {},
+                  "spec": {"name": "locked_public", "description": "Public but admin-scoped.",
+                           "auth": {"required_scopes": ["x:y"]},
+                           "input_schema": {"type": "object", "properties": {}}}}}})
+    s._swap(_CompiledManifest(m))
+
+    @s.tool("get_invoice")                       # default: auth required
+    async def gi(ctx, invoice_id, max_results=100): return {"ok": 1}
+
+    @s.tool("ping_public", public=True)          # team's choice: no auth
+    async def pp(ctx): return {"pong": True, "caller": ctx.user.id}
+
+    @s.tool("locked_public", public=True)        # public in code, scoped by admin
+    async def lp(ctx): return {"secret": True}
+
+    async def run():
+        call = lambda name, hdrs=None: s.handle_request(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+             "params": {"name": name, "arguments": {} if name != "get_invoice"
+                        else {"invoice_id": "i"}}}, hdrs or {})
+        r = await call("get_invoice")
+        assert r["error"]["code"] == -32001              # gated tool: anonymous denied
+        r = await call("ping_public")
+        assert json.loads(r["result"]["content"][0]["text"])["pong"] is True  # public: allowed
+        r = await call("locked_public")
+        assert r["error"]["code"] == -32001              # admin scopes beat code-public
+        r = await call("get_invoice", {"authorization": "Bearer t"})
+        assert "error" not in r                          # authenticated: fine
+    asyncio.get_event_loop().run_until_complete(run())
