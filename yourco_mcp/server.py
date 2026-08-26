@@ -89,6 +89,7 @@ class ProductServer:
         self.product_key = product_key
         self._handlers: Dict[str, Callable] = {}
         self._public_tools: set = set()
+        self._code_scopes: Dict[str, list] = {}
         self._authorize_hook: Optional[Callable] = None
         if callable(auth) and not isinstance(auth, AuthProvider):
             auth = CallableProvider(auth)
@@ -99,15 +100,20 @@ class ProductServer:
 
     # ---- registration API ----
 
-    def tool(self, name: str, public: bool = False):
-        """Register a handler. public=True lets THIS tool execute without
-        authentication even when the policy gates tools/call — the product
-        team's per-tool choice. Registry-set required_scopes still win:
-        if an admin attaches scopes to a public tool, auth is required again."""
+    def tool(self, name: str, public: bool = False, scopes: Optional[list] = None):
+        """Register a handler.
+
+        public=True    — THIS tool executes without authentication (team's choice)
+        scopes=[...]   — code-declared required scopes for this tool; enforced in
+                         UNION with any registry-set required_scopes (either side
+                         may tighten, neither can loosen the other)
+        """
         def register(fn):
             self._handlers[name] = fn
             if public:
                 self._public_tools.add(name)
+            if scopes:
+                self._code_scopes[name] = list(scopes)
             return fn
         return register
 
@@ -241,7 +247,8 @@ class ProductServer:
         view = (self._compiled.tools.get(audience) or {}).get(name)
         if view is None or name not in self._handlers:
             raise _McpFailure(JSONRPC_METHOD_NOT_FOUND, f"Unknown or disabled tool: {name}")
-        required_scopes = (view["spec"].get("auth") or {}).get("required_scopes", [])
+        required_scopes = list({*(view["spec"].get("auth") or {}).get("required_scopes", []),
+                                *self._code_scopes.get(name, [])})
         if required_scopes:
             # admin-set scopes always require auth — even on a code-public tool
             if user is None or not scope_satisfied(user, required_scopes):

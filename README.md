@@ -68,7 +68,40 @@ class MyProductAuth(AuthProvider):
 server = ProductServer(..., auth=MyProductAuth())
 ```
 
-A plain `async def fn(headers) -> AuthUser | None` works too. Built-ins:
+A plain `async def fn(headers) -> AuthUser | None` works too.
+
+**Real-world example — Firebase bearer + roles from your DB:**
+
+```python
+import asyncio
+import firebase_admin
+from firebase_admin import auth as fb_auth
+from yourco_mcp import AuthProvider, AuthUser
+
+firebase_admin.initialize_app()                      # your service account creds
+
+class FirebaseAuth(AuthProvider):
+    async def authenticate(self, headers) -> AuthUser | None:
+        token = headers.get("authorization", "").removeprefix("Bearer ").strip()
+        try:                                          # verify_id_token is blocking:
+            decoded = await asyncio.to_thread(fb_auth.verify_id_token, token)
+        except Exception:
+            return None
+        roles = await my_db.fetch_roles(decoded["uid"])       # YOUR roles table
+        return AuthUser(id=decoded["uid"],
+                        scopes=[f"role:{r}" for r in roles],   # roles become scopes
+                        claims=decoded)
+```
+
+Then require roles **per tool, right at the decorator**:
+
+```python
+@server.tool("refund_payment", scopes=["role:finance-admin"])
+async def refund_payment(ctx, payment_id: str, amount: float): ...
+```
+
+Code-declared `scopes` enforce in **union** with registry-set `required_scopes`
+— either side may tighten a tool, neither can loosen the other. Built-ins:
 `ApiKeyAuthProvider({key: {...}})`, `StaticTokenProvider({token: {...}})`, and
 `NoAuth()` — the **explicit** opt-out for genuinely open servers (nothing is ever
 open by accident).

@@ -174,3 +174,28 @@ def test_unknown_contract_refused_cleanly():
     c = RegistryClient("http://x", "p", "k", transport=FakeTransport())
     with pytest.raises(RegistryError, match="contract 'v2'"):
         asyncio.get_event_loop().run_until_complete(c.fetch_manifest())
+
+
+def test_code_declared_scopes_union_with_registry():
+    """@server.tool(scopes=[...]) enforces in UNION with registry scopes."""
+    from yourco_mcp.auth import StaticTokenProvider
+    s = ProductServer("http://x", "billing", "key", auth=StaticTokenProvider({
+        "half": {"id": "u1", "scopes": ["code:scope"]},
+        "full": {"id": "u2", "scopes": ["code:scope", "registry:scope"]}}))
+    m = json.loads(json.dumps(MANIFEST))
+    m["entities"][0]["views"]["external"]["spec"]["auth"] = {"required_scopes": ["registry:scope"]}
+    s._swap(_CompiledManifest(m))
+
+    @s.tool("get_invoice", scopes=["code:scope"])
+    async def gi(ctx, invoice_id, max_results=100): return {"ok": True}
+
+    async def run():
+        call = lambda tok: s.handle_request(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+             "params": {"name": "get_invoice", "arguments": {"invoice_id": "i"}}},
+            {"authorization": f"Bearer {tok}"})
+        r = await call("half")
+        assert r["error"]["code"] == -32003      # has code scope, missing registry scope
+        r = await call("full")
+        assert "error" not in r                  # union satisfied
+    asyncio.get_event_loop().run_until_complete(run())
