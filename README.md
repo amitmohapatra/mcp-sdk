@@ -70,7 +70,11 @@ server = ProductServer(..., auth=MyProductAuth())
 
 A plain `async def fn(headers) -> AuthUser | None` works too.
 
-**Real-world example — Firebase bearer + roles from your DB:**
+**The framework's responsibility ends at the interface.** What happens inside
+`authenticate` is your business logic and yours alone — Firebase, Auth0, Keycloak,
+your own JWT issuer, a session table, mTLS, LDAP, anything. The SDK never imports,
+bundles, or favors any identity system; it only consumes the `AuthUser` you return.
+The example below happens to use Firebase purely as an illustration:
 
 ```python
 import asyncio
