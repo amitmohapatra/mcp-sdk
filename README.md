@@ -1,38 +1,30 @@
 # yourco-mcp — MCP SDK for the AI Registry
 
-Build an MCP server whose tool metadata (descriptions, schemas, audiences,
-auth scopes) lives in the AI Registry and hot-reloads at runtime. You write
-handlers; admins manage everything else in the registry UI.
+Build an MCP server whose tool **metadata lives in the AI Registry** and hot-reloads
+at runtime. You write handler functions; everything else — descriptions, schemas,
+audiences, per-tool scopes, exposure — is managed by admins in the registry UI and
+reaches your running server in milliseconds, with no redeploy.
+
+```
+Registry (control plane)          Your server (data plane, this SDK)
+  admins edit metadata   ──push──▶  in-memory manifest ──▶ answers MCP calls
+  UI / RBAC / versions              your handlers      ──▶ your business logic
+```
+
+Your server never blocks on the registry: all MCP traffic is served from memory,
+and if the registry is down your server keeps running (see Resilience).
 
 ## Install
 
-From the monorepo (local development):
-
 ```bash
-pip install ./sdk/python                    # or:  pip install -e ./sdk/python
+pip install "yourco-mcp[server,redis] @ git+https://github.com/amitmohapatra/mcp-sdk.git"
 ```
 
-Straight from git (pin a tag in production):
+Pin a tag in production (`...mcp-sdk.git@v0.1.0`). Extras: `server` bundles uvicorn
+for `server.run()`; `redis` enables Redis pub/sub (recommended in prod — without it
+the SDK falls back to the registry's SSE stream automatically).
 
-```bash
-pip install "yourco-mcp @ git+ssh://git@github.com/amitmohapatra/mcp-sdk.git@v0.1.0#subdirectory=sdk/python"
-```
-
-From your private index (recommended for product teams — publish with
-`python -m build` + `twine upload` to Artifactory/CodeArtifact/devpi):
-
-```bash
-pip install yourco-mcp
-```
-
-Optional extras:
-
-```bash
-pip install "yourco-mcp[redis]"     # Redis pub/sub subscription (recommended in prod)
-pip install "yourco-mcp[server]"    # bundled uvicorn for server.run()
-```
-
-## Quick start
+## Quick start — the whole integration
 
 ```python
 import os
@@ -40,16 +32,114 @@ from yourco_mcp import ProductServer
 
 server = ProductServer(
     registry_url="https://registry.yourco.com",
-    product_key="billing",                    # which product this server belongs to
-    api_key=os.environ["REGISTRY_API_KEY"],   # issued in the registry UI (Manage -> SDK API keys)
+    product_key="billing",                    # your product's key in the registry
+    api_key=os.environ["REGISTRY_API_KEY"],   # issued in the UI: Manage -> SDK API keys
 )
 
-@server.tool("get_invoice")                   # bound by NAME; metadata comes from the registry
+@server.tool("get_invoice")                   # bound by NAME — metadata comes from the registry
 async def get_invoice(ctx, invoice_id: str, max_results: int = 100):
     return {"invoice_id": invoice_id, "max_results": max_results}
 
 if __name__ == "__main__":
-    server.run(port=8080)                     # stateless MCP over HTTP at /mcp
+    server.run(port=8080)                     # stateless MCP over HTTP at POST /mcp
 ```
 
-Auth, audiences, pins, hot reload, snapshots: see the repo root README.
+Notice what is **absent**: no descriptions, no JSON schemas, no Redis config, no auth
+boilerplate. The registry owns metadata; your code owns behavior. If the registry
+lists a tool you have no handler for, it is excluded from `tools/list` with a warning
+(fail-safe, never fail-crash).
+
+## Authentication — you own identity, the SDK owns enforcement
+
+**Each product handles auth for its own tools.** The SDK never sees your passwords,
+keys, or token formats — you implement exactly one method: *headers in, user out.*
+
+```python
+from yourco_mcp import ProductServer, AuthProvider, AuthUser
+
+class MyProductAuth(AuthProvider):
+    async def authenticate(self, headers) -> AuthUser | None:
+        token = headers.get("authorization", "").removeprefix("Bearer ")
+        claims = my_jwt_verify(token)          # YOUR auth: your JWT lib, your OAuth
+        if not claims:                         # introspection, your session store
+            return None
+        return AuthUser(id=claims["sub"], scopes=claims.get("scopes", []))
+
+server = ProductServer(..., auth=MyProductAuth())
+```
+
+A plain `async def fn(headers) -> AuthUser | None` works too. Built-ins:
+`ApiKeyAuthProvider({key: {...}})`, `StaticTokenProvider({token: {...}})`, and
+`NoAuth()` — the **explicit** opt-out for genuinely open servers (nothing is ever
+open by accident).
+
+Once your verifier exists, the SDK enforces — you write none of this:
+
+| Layer | Behavior | You configure it… |
+|---|---|---|
+| Default policy | `tools/list` open; `tools/call` requires an authenticated user (`-32001` otherwise) | never (or swap `policy=AllGatedPolicy()`) |
+| Audience entitlement | `x-tool-audience: internal` honored only if the user's scopes include `audience:internal`; everyone else is silently downgraded to the default audience | by which scopes your auth mints |
+| Per-tool scopes | a tool with `required_scopes: ["payments:write"]` in the registry rejects callers without that scope (`-32003`) — admins tighten this at runtime, no redeploy | in the registry UI |
+| Business rules | arbitrary code check after the scope checks | `@server.authorize` hook |
+
+```python
+@server.authorize
+async def gate(user, tool, args) -> bool:
+    return not (tool == "refund_payment" and args["amount"] > 10_000
+                and "payments:admin" not in user.scopes)
+```
+
+**Company scope conventions** (align once, org-wide):
+- `audience:<key>` — grants an audience (e.g. `audience:internal` for internal agents)
+- `<domain>:<action>` — per-tool requirements admins set in the registry
+  (e.g. `payments:write`, `invoices:read`)
+
+## Audiences, hidden parameters, fixed values
+
+Admins can expose one tool differently per audience (e.g. `external` vs `internal`):
+different descriptions, extra internal-only parameters, or parameters that are
+**hidden** from an audience with a **fixed value sent to your handler** instead —
+callers can never see or override it. Your handler just declares the parameter with
+a default; the SDK validates arguments against the caller's audience schema, strips
+unknown arguments, and injects fixed values before your code runs.
+
+```python
+@server.tool("charge_card")
+async def charge_card(ctx, card_id: str, amount: float, currency: str = "USD"):
+    # external callers can't even see `currency` — the SDK always passes the
+    # admin-fixed value; internal callers control it. ctx.audience tells you which.
+    ...
+```
+
+`ctx` gives you `ctx.user` (the AuthUser), `ctx.audience`, and `ctx.tool`.
+
+## Live updates — how a registry save reaches your server
+
+1. Admin saves in the registry → one transaction bumps the product's sequence number
+   and publishes an event carrying the already-resolved views.
+2. Your server (subscribed since startup — Redis if your product has it configured,
+   the registry's SSE stream otherwise; the manifest tells the SDK which) receives it.
+3. Sequence check: next-in-order → applied as an atomic manifest swap; stale →
+   ignored; a gap → full re-fetch and reconcile. Convergence is guaranteed.
+4. The next `tools/list`/`tools/call` serves the new metadata. Typical latency:
+   **single-digit milliseconds** (Redis) to a few hundred ms (SSE).
+
+## Resilience
+
+- **Registry down** → your server keeps serving from memory, including the latest
+  applied update. The registry is a control plane, never a runtime dependency.
+- **Cold start while registry is down** → served from the last-known-good snapshot
+  file (`snapshot_path=...`, default `.yourco_mcp_<product>.snapshot.json`).
+- **Bad/malformed update** → logged, ignored, re-synced; a good manifest is never
+  replaced by a broken one.
+- **Stateless HTTP** → run N replicas behind any load balancer; no sticky sessions.
+
+## Checklist for a new product team
+
+1. Ask a registry admin to onboard your product and hand you an **API key**.
+2. `pip install` (above), set `REGISTRY_API_KEY` in your deployment env.
+3. Write handlers for the tools your product owns (names must match the registry).
+4. Wire your existing auth into one `AuthProvider.authenticate` method.
+5. Decide which of your tokens carry `audience:*` scopes (internal agents etc.).
+6. `server.run()` — verify with `curl localhost:8080/healthz` and an MCP
+   `tools/list`. Edit a description in the registry UI and watch it change live.
