@@ -158,3 +158,19 @@ def test_per_tool_public_execution():
         r = await call("get_invoice", {"authorization": "Bearer t"})
         assert "error" not in r                          # authenticated: fine
     asyncio.get_event_loop().run_until_complete(run())
+
+
+def test_unknown_contract_refused_cleanly():
+    """A future registry contract must be REFUSED (fall back to snapshot),
+    never mis-parsed into an empty tool list."""
+    import httpx
+    from yourco_mcp.client import RegistryClient, RegistryError
+
+    class FakeTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            return httpx.Response(200, json={"contract": "v2", "seq": 1,
+                                             "product_key": "p", "entities": []})
+
+    c = RegistryClient("http://x", "p", "k", transport=FakeTransport())
+    with pytest.raises(RegistryError, match="contract 'v2'"):
+        asyncio.get_event_loop().run_until_complete(c.fetch_manifest())

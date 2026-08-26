@@ -52,12 +52,21 @@ class RegistryClient:
         return httpx.AsyncClient(transport=self._transport, base_url=self.registry_url,
                                  headers={"X-API-Key": self.api_key}, timeout=15)
 
+    SUPPORTED_CONTRACTS = {"v1"}
+
     async def fetch_manifest(self) -> dict:
         async with self._http() as client:
             r = await client.get(f"/v1/products/{self.product_key}/manifest")
             if r.status_code != 200:
                 raise RegistryError(f"manifest fetch failed: HTTP {r.status_code}")
             manifest = r.json()
+        contract = manifest.get("contract", "v1")
+        if contract not in self.SUPPORTED_CONTRACTS:
+            # refuse cleanly rather than mis-parse: callers fall back to the
+            # snapshot / last-known-good manifest and keep serving
+            raise RegistryError(
+                f"registry speaks contract '{contract}' but this SDK supports "
+                f"{sorted(self.SUPPORTED_CONTRACTS)} — upgrade yourco-mcp")
         self.save_snapshot(manifest)
         return manifest
 
