@@ -15,7 +15,7 @@ pip install ./sdk/python                    # or:  pip install -e ./sdk/python
 Straight from git (pin a tag in production):
 
 ```bash
-pip install "yourco-mcp @ git+ssh://git@github.com/yourco/ai-registry.git@v0.1.0#subdirectory=sdk/python"
+pip install "yourco-mcp @ git+ssh://git@github.com/amitmohapatra/mcp-sdk.git@v0.1.0#subdirectory=sdk/python"
 ```
 
 From your private index (recommended for product teams — publish with
