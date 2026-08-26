@@ -9,12 +9,12 @@
 Metadata (descriptions, schemas, audiences, auth scopes) is controlled in the
 registry UI at runtime; this SDK syncs it live and serves stateless MCP over HTTP.
 """
-from .auth import (AllGatedPolicy, ApiKeyAuthProvider, AuthPolicy, AuthProvider, AuthUser,
+from .auth import (ApiKeyAuthProvider, AuthPolicy, AuthProvider, AuthUser,
                    DefaultPolicy, NoAuth, StaticTokenProvider)
 from .client import RegistryClient, RegistryError
 from .server import ProductServer, ToolContext
 
 __all__ = ["ProductServer", "ToolContext", "RegistryClient", "RegistryError",
-           "AuthUser", "AuthProvider", "AuthPolicy", "DefaultPolicy", "AllGatedPolicy",
+           "AuthUser", "AuthProvider", "AuthPolicy", "DefaultPolicy",
            "NoAuth", "ApiKeyAuthProvider", "StaticTokenProvider"]
-__version__ = "0.2.0"
+__version__ = "0.3.0"

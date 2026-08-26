@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from yourco_mcp import AuthUser, DefaultPolicy, AllGatedPolicy, NoAuth
+from yourco_mcp import AuthUser, DefaultPolicy, NoAuth
 from yourco_mcp.auth import scope_satisfied
 from yourco_mcp.server import _CompiledManifest, ProductServer
 
@@ -94,9 +94,11 @@ def test_prepare_args_strips_pins_and_validates():
 
 
 def test_auth_policies_and_scopes():
-    d, g = DefaultPolicy(), AllGatedPolicy()
-    assert not d.requires_auth("tools/list") and d.requires_auth("tools/call")
-    assert g.requires_auth("tools/list") and not g.requires_auth("ping")
+    d = DefaultPolicy()
+    # INVARIANT: discovery is always public; execution is gated by default
+    for m in ("initialize", "ping", "tools/list"):
+        assert not d.requires_auth(m)
+    assert d.requires_auth("tools/call")
     assert scope_satisfied(AuthUser(id="x", scopes=["*"]), ["anything"])
     assert not scope_satisfied(AuthUser(id="x", scopes=["a"]), ["a", "b"])
 

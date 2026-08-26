@@ -54,23 +54,20 @@ class CallableProvider(AuthProvider):
 
 
 class AuthPolicy:
-    """Which MCP methods require an authenticated caller."""
+    """Which MCP methods require an authenticated caller.
+
+    INVARIANT: discovery (initialize, ping, tools/list) is ALWAYS public —
+    gateways and catalogs (e.g. Bifrost) must be able to enumerate tools
+    without credentials. Execution auth is fully pluggable per product and
+    per tool; only the discovery surface is non-negotiable."""
+    ALWAYS_OPEN = {"initialize", "ping", "tools/list", "notifications/initialized"}
+
     def requires_auth(self, method: str) -> bool:
-        raise NotImplementedError
+        return method not in self.ALWAYS_OPEN
 
 
 class DefaultPolicy(AuthPolicy):
-    OPEN = {"initialize", "ping", "tools/list", "notifications/initialized"}
-
-    def requires_auth(self, method: str) -> bool:
-        return method not in self.OPEN
-
-
-class AllGatedPolicy(AuthPolicy):
-    OPEN = {"initialize", "ping", "notifications/initialized"}
-
-    def requires_auth(self, method: str) -> bool:
-        return method not in self.OPEN
+    pass
 
 
 def scope_satisfied(user: AuthUser, required: list) -> bool:
