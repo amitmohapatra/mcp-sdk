@@ -39,7 +39,6 @@ server = ProductServer(
     product_key="payments",
     api_key=os.environ["REGISTRY_API_KEY"],
     auth=PaymentsAuth(),
-    snapshot_path="/var/tmp/payments.snapshot.json",   # survives registry outages
 )
 
 # ---------------------------------------------------------------------------

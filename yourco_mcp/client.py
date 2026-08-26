@@ -15,13 +15,37 @@ class RegistryError(Exception):
     pass
 
 
+def _default_snapshot_path(product_key: str) -> Path:
+    """Resilience cache location — chosen automatically, teams never configure it.
+    Order: $YOURCO_MCP_CACHE_DIR > ~/.cache/yourco-mcp > system temp dir.
+    Each candidate is verified writable; failures fall through silently."""
+    import os
+    import tempfile
+    candidates = []
+    if os.environ.get("YOURCO_MCP_CACHE_DIR"):
+        candidates.append(Path(os.environ["YOURCO_MCP_CACHE_DIR"]))
+    candidates.append(Path.home() / ".cache" / "yourco-mcp")
+    candidates.append(Path(tempfile.gettempdir()) / "yourco-mcp")
+    for d in candidates:
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            probe = d / ".probe"
+            probe.write_text("")
+            probe.unlink()
+            return d / f"{product_key}.snapshot.json"
+        except OSError:
+            continue
+    return Path(tempfile.gettempdir()) / f"yourco-mcp-{product_key}.snapshot.json"
+
+
 class RegistryClient:
     def __init__(self, registry_url: str, product_key: str, api_key: str,
                  snapshot_path: str = "", transport: Optional[httpx.AsyncBaseTransport] = None):
         self.registry_url = registry_url.rstrip("/")
         self.product_key = product_key
         self.api_key = api_key
-        self.snapshot_path = Path(snapshot_path or f".yourco_mcp_{product_key}.snapshot.json")
+        self.snapshot_path = Path(snapshot_path) if snapshot_path \
+            else _default_snapshot_path(product_key)
         self._transport = transport
 
     def _http(self) -> httpx.AsyncClient:

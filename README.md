@@ -153,8 +153,9 @@ async def charge_card(ctx, card_id: str, amount: float, currency: str = "USD"):
 
 - **Registry down** → your server keeps serving from memory, including the latest
   applied update. The registry is a control plane, never a runtime dependency.
-- **Cold start while registry is down** → served from the last-known-good snapshot
-  file (`snapshot_path=...`, default `.yourco_mcp_<product>.snapshot.json`).
+- **Cold start while registry is down** → served from a last-known-good snapshot
+  the SDK maintains automatically (cached under `~/.cache/yourco-mcp/`; override
+  the location with `YOURCO_MCP_CACHE_DIR` if your runtime needs it).
 - **Bad/malformed update** → logged, ignored, re-synced; a good manifest is never
   replaced by a broken one.
 - **Stateless HTTP** → run N replicas behind any load balancer; no sticky sessions.
