@@ -1,0 +1,13 @@
+# Enterprise lint gate — enforced in CI.
+line-length = 100
+
+[lint]
+select = ["F", "E", "W", "B", "SIM", "ARG"]
+ignore = [
+  "E501",            # long lines: reviewed case-by-case, not mechanically
+  "B008",            # FastAPI's `Depends(...)` in defaults is the framework idiom
+  "ARG001", "ARG002" # framework callbacks (lifespan, request handlers, ABC impls)
+]
+
+[lint.per-file-ignores]
+"app/similarity.py" = ["E402"]   # deliberate late imports keep numpy off cold paths

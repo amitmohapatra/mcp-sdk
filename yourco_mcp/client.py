@@ -1,10 +1,9 @@
 """RegistryClient: bootstrap fetch + live subscription + snapshot fallback.
 Transport and subscriber are injectable (tests, custom infra)."""
-import asyncio
 import json
 import logging
 from pathlib import Path
-from typing import AsyncIterator, Callable, Optional
+from typing import AsyncIterator, Optional
 
 import httpx
 
@@ -118,11 +117,11 @@ class RegistryClient:
                     yield json.loads(msg["data"])
 
     async def _subscribe_sse(self) -> AsyncIterator[dict]:
-        async with self._http() as client:
-            async with client.stream("GET", f"/v1/products/{self.product_key}/events",
-                                     timeout=None) as resp:
-                async for line in resp.aiter_lines():
-                    if line.startswith("data: "):
-                        payload = json.loads(line[6:])
-                        if "type" in payload:
-                            yield payload
+        async with self._http() as client, \
+                client.stream("GET", f"/v1/products/{self.product_key}/events",
+                              timeout=None) as resp:
+            async for line in resp.aiter_lines():
+                if line.startswith("data: "):
+                    payload = json.loads(line[6:])
+                    if "type" in payload:
+                        yield payload
