@@ -9,6 +9,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Optional
 
@@ -34,9 +35,25 @@ class ToolContext:
     meta: dict = field(default_factory=dict)
 
 
-class _CompiledManifest:
-    """Immutable, pre-compiled view of a manifest: validators built once per swap,
-    O(1) lookups on the request path."""
+class ToolCatalog:
+    """A compiled manifest: what each audience may see, and how a call is prepared.
+
+    Public because the enforcement is the valuable part, not the transport. A team that
+    already has an MCP server — FastMCP, the official SDK, anything — can take this alone
+    and keep their own server::
+
+        catalog = ToolCatalog(await RegistryClient(...).fetch_or_snapshot())
+        for tool in catalog.tools_for("internal"):      # what this audience may see
+            my_server.add_tool(**tool)
+        args = catalog.prepare("get_invoice", "internal", caller_args)   # strip, default,
+                                                                        # validate, pin
+
+    Without it, "use the registry" means "fetch some JSON and reimplement argument
+    preparation", and the half that matters — unknown arguments stripped, pins applied so a
+    caller cannot override them — is the half they would get wrong.
+
+    Validators are built once per swap so the request path is O(1) lookups.
+    """
 
     def __init__(self, manifest: dict):
         self.raw = manifest
@@ -60,7 +77,74 @@ class _CompiledManifest:
                     log.error("invalid schema for %s/%s; tool excluded", audience, entity["name"])
                     self.tools[audience].pop(entity["name"], None)
 
-    def apply(self, event: dict) -> "_CompiledManifest":
+    def tools_for(self, audience: str) -> list:
+        """Tool definitions this audience may see, in MCP ``tools/list`` shape.
+
+        Pass ``names`` on the server side to intersect with the handlers you actually have;
+        a tool listed here with no handler behind it is a promise you cannot keep.
+        """
+        out = []
+        for name, view in sorted((self.tools.get(audience) or {}).items()):
+            spec = view["spec"]
+            out.append({"name": name, "title": spec.get("title", name),
+                        "description": spec.get("description", ""),
+                        "inputSchema": spec.get("input_schema", {"type": "object"}),
+                        "annotations": spec.get("annotations", {})})
+        return out
+
+    def required_scopes(self, name: str, audience: str, code_scopes: Optional[list] = None) -> list:
+        """Scopes a caller must hold, as the UNION of registry-set and code-declared.
+
+        A union rather than an override, deliberately: either side may tighten, neither can
+        loosen the other. An admin cannot open a tool the code says is privileged, and code
+        cannot ignore a scope an administrator added.
+        """
+        view = (self.tools.get(audience) or {}).get(name) or {}
+        registry = (view.get("spec", {}).get("auth") or {}).get("required_scopes", [])
+        return list({*registry, *(code_scopes or [])})
+
+    def prepare(self, name: str, audience: str, raw: dict) -> dict:
+        """Arguments as the handler should receive them, or raise ``InvalidArguments``.
+
+        Four steps, in this order and for a reason: unknown keys are **stripped** (a hidden
+        parameter must not be settable by naming it), schema defaults are filled, the result
+        is validated against the audience's own schema, and pins are applied **last** so a
+        caller can never override a value an administrator fixed.
+        """
+        view = (self.tools.get(audience) or {}).get(name)
+        if view is None:
+            raise InvalidArguments(f"Unknown or disabled tool: {name}")
+        schema = view["spec"].get("input_schema") or {}
+        props = schema.get("properties", {})
+        args = {k: v for k, v in raw.items() if k in props}
+        for pname, pspec in props.items():
+            if pname not in args and "default" in pspec:
+                args[pname] = pspec["default"]
+        validator = self.validators.get((audience, name))
+        if validator:
+            errors = sorted(validator.iter_errors(args), key=lambda e: list(e.absolute_path))
+            if errors:
+                detail = "; ".join(f"{'/'.join(map(str, e.absolute_path)) or 'arguments'}: "
+                                   f"{e.message}" for e in errors[:5])
+                raise InvalidArguments(f"Invalid arguments: {detail}")
+        args.update(view.get("pins") or {})
+        return args
+
+    def audience_for(self, requested: str, user: Optional[AuthUser]) -> str:
+        """Which audience this caller actually gets. The header *requests*; auth *grants*.
+
+        An unentitled request is downgraded to the default rather than refused, so a
+        mistyped or over-reaching header degrades to the public view instead of leaking an
+        internal one or failing the call.
+        """
+        requested = requested or self.default_audience
+        if requested == self.default_audience:
+            return requested
+        if requested in self.audiences and user and scope_satisfied(user, [f"audience:{requested}"]):
+            return requested
+        return self.default_audience
+
+    def apply(self, event: dict) -> "ToolCatalog":
         """Pure delta application -> NEW compiled manifest (never mutates self)."""
         raw = json.loads(json.dumps(self.raw))
         raw["seq"] = event["seq"]
@@ -75,15 +159,28 @@ class _CompiledManifest:
         elif etype == "entity.deleted" and body:
             entities.pop((body.get("type", "tool"), body["name"]), None)
         raw["entities"] = list(entities.values())
-        return _CompiledManifest(raw)
+        return ToolCatalog(raw)
 
 
 class ProductServer:
-    def __init__(self, registry_url: str, product_key: str, api_key: str,
+    def __init__(self, registry_url: str = "", product_key: str = "", api_key: str = "",
                  auth: Optional[AuthProvider] = None,
                  policy: Optional[AuthPolicy] = None,
                  snapshot_path: str = "",
                  client: Optional[RegistryClient] = None):
+        # Addresses and credentials are deployment facts, so they default to the
+        # environment: the same source then serves dev and prod without an edit, and a
+        # product key never has to be typed into a repository.
+        registry_url = registry_url or os.environ.get("REGISTRY_URL", "")
+        product_key = product_key or os.environ.get("REGISTRY_PRODUCT_KEY", "")
+        api_key = api_key or os.environ.get("REGISTRY_API_KEY", "")
+        if client is None and not (registry_url and product_key and api_key):
+            missing = [n for n, v in (("REGISTRY_URL", registry_url),
+                                      ("REGISTRY_PRODUCT_KEY", product_key),
+                                      ("REGISTRY_API_KEY", api_key)) if not v]
+            # Named, and at construction. A partially-configured server that starts and then
+            # fails on its first manifest fetch reads as an outage, not a missing setting.
+            raise ValueError(f"ProductServer needs {', '.join(missing)} (argument or env var)")
         self.client = client or RegistryClient(registry_url, product_key, api_key,
                                                snapshot_path=snapshot_path)
         self.product_key = product_key
@@ -95,7 +192,7 @@ class ProductServer:
             auth = CallableProvider(auth)
         self.auth: Optional[AuthProvider] = auth
         self.policy: AuthPolicy = policy or DefaultPolicy()
-        self._compiled: Optional[_CompiledManifest] = None
+        self._compiled: Optional[ToolCatalog] = None
         self._listen_task: Optional[asyncio.Task] = None
 
     # ---- registration API ----
@@ -128,7 +225,7 @@ class ProductServer:
         if self._compiled is not None:
             return                                    # idempotent: already started
         manifest = await self.client.fetch_or_snapshot()
-        self._swap(_CompiledManifest(manifest))
+        self._swap(ToolCatalog(manifest))
         self._warn_unbound()
         self._listen_task = asyncio.create_task(self._listen())
 
@@ -138,7 +235,7 @@ class ProductServer:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._listen_task
 
-    def _swap(self, compiled: "_CompiledManifest") -> None:
+    def _swap(self, compiled: "ToolCatalog") -> None:
         self._compiled = compiled                     # atomic reference swap
 
     def _warn_unbound(self) -> None:
@@ -170,7 +267,7 @@ class ProductServer:
                 with contextlib.suppress(Exception):
                     fresh = await self.client.fetch_if_changed(self._compiled.seq)
                     if fresh is not None:
-                        self._swap(_CompiledManifest(fresh))
+                        self._swap(ToolCatalog(fresh))
 
     async def handle_event(self, event: dict) -> None:
         current = self._compiled
@@ -193,18 +290,12 @@ class ProductServer:
 
     async def _refetch(self) -> None:
         with contextlib.suppress(Exception):
-            self._swap(_CompiledManifest(await self.client.fetch_manifest()))
+            self._swap(ToolCatalog(await self.client.fetch_manifest()))
 
     # ---- audience resolution: header REQUESTS, auth GRANTS ----
 
     def resolve_audience(self, headers: dict, user: Optional[AuthUser]) -> str:
-        requested = headers.get(AUDIENCE_HEADER, "") or self._compiled.default_audience
-        if requested == self._compiled.default_audience:
-            return requested
-        if requested in self._compiled.audiences and user and \
-                scope_satisfied(user, [f"audience:{requested}"]):
-            return requested
-        return self._compiled.default_audience        # unentitled -> safe downgrade
+        return self._compiled.audience_for(headers.get(AUDIENCE_HEADER, ""), user)
 
     # ---- MCP JSON-RPC (stateless) ----
 
@@ -242,16 +333,8 @@ class ProductServer:
         return {"jsonrpc": "2.0", "id": rid, "result": result}
 
     def _list_tools(self, audience: str) -> list:
-        out = []
-        for name, view in sorted((self._compiled.tools.get(audience) or {}).items()):
-            if name not in self._handlers:
-                continue
-            spec = view["spec"]
-            out.append({"name": name, "title": spec.get("title", name),
-                        "description": spec.get("description", ""),
-                        "inputSchema": spec.get("input_schema", {"type": "object"}),
-                        "annotations": spec.get("annotations", {})})
-        return out
+        """What the catalog offers, narrowed to tools this process can actually serve."""
+        return [t for t in self._compiled.tools_for(audience) if t["name"] in self._handlers]
 
     async def _call_tool(self, params: dict, user: Optional[AuthUser], audience: str) -> dict:
         name = params.get("name", "")
@@ -259,8 +342,8 @@ class ProductServer:
         view = (self._compiled.tools.get(audience) or {}).get(name)
         if view is None or name not in self._handlers:
             raise _McpFailure(JSONRPC_METHOD_NOT_FOUND, f"Unknown or disabled tool: {name}")
-        required_scopes = list({*(view["spec"].get("auth") or {}).get("required_scopes", []),
-                                *self._code_scopes.get(name, [])})
+        required_scopes = self._compiled.required_scopes(
+            name, audience, self._code_scopes.get(name))
         if required_scopes:
             # admin-set scopes always require auth — even on a code-public tool
             if user is None or not scope_satisfied(user, required_scopes):
@@ -269,30 +352,16 @@ class ProductServer:
         elif user is None and self.policy.requires_auth("tools/call") \
                 and name not in self._public_tools:
             raise _McpFailure(MCP_UNAUTHORIZED, "Unauthorized")
-        args = self._prepare_args(view, audience, name, raw_args)
+        try:
+            args = self._compiled.prepare(name, audience, raw_args)
+        except InvalidArguments as exc:
+            raise _McpFailure(JSONRPC_INVALID_PARAMS, str(exc)) from exc
         if self._authorize_hook and not await self._authorize_hook(user, name, args):
             raise _McpFailure(MCP_FORBIDDEN, "Not authorized for this call")
         ctx = ToolContext(user=user or AuthUser(id="anonymous"), audience=audience, tool=name)
         result = await self._handlers[name](ctx, **args)
         text = result if isinstance(result, str) else json.dumps(result, default=str)
         return {"content": [{"type": "text", "text": text}], "isError": False}
-
-    def _prepare_args(self, view: dict, audience: str, name: str, raw: dict) -> dict:
-        schema = view["spec"].get("input_schema") or {}
-        props = schema.get("properties", {})
-        args = {k: v for k, v in raw.items() if k in props}     # strip unknown/hidden
-        for pname, pspec in props.items():                       # schema defaults
-            if pname not in args and "default" in pspec:
-                args[pname] = pspec["default"]
-        validator = self._compiled.validators.get((audience, name))
-        if validator:
-            errors = sorted(validator.iter_errors(args), key=lambda e: list(e.absolute_path))
-            if errors:
-                detail = "; ".join(f"{'/'.join(map(str, e.absolute_path)) or 'arguments'}: "
-                                   f"{e.message}" for e in errors[:5])
-                raise _McpFailure(JSONRPC_INVALID_PARAMS, f"Invalid arguments: {detail}")
-        args.update(view.get("pins") or {})                      # pins win, always
-        return args
 
     # ---- ASGI app (Starlette, stateless Streamable HTTP) ----
 
@@ -326,6 +395,11 @@ class ProductServer:
     def run(self, host: str = "0.0.0.0", port: int = 8080):
         import uvicorn
         uvicorn.run(self.build_asgi(), host=host, port=port)
+
+
+class InvalidArguments(Exception):
+    """Arguments a handler must not be given. Public so a bring-your-own-server caller can
+    catch it and map it onto whatever their transport reports."""
 
 
 class _McpFailure(Exception):

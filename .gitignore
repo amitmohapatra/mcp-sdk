@@ -7,3 +7,10 @@ build/
 dist/
 *.snapshot.json
 .DS_Store
+
+# never publish credentials
+.env
+*.env
+!.env.example
+secrets*
+*.pem

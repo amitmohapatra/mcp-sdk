@@ -7,9 +7,9 @@ import json
 
 import pytest
 
-from yourco_mcp import AuthUser, DefaultPolicy, NoAuth
+from yourco_mcp import AuthUser, DefaultPolicy, InvalidArguments, NoAuth
 from yourco_mcp.auth import scope_satisfied
-from yourco_mcp.server import _CompiledManifest, ProductServer
+from yourco_mcp.server import ProductServer, ToolCatalog
 
 MANIFEST = {
     "contract": "v1", "product_key": "billing", "seq": 1,
@@ -38,7 +38,7 @@ MANIFEST = {
 
 def make_server():
     s = ProductServer("http://x", "billing", "key", auth=NoAuth())
-    s._swap(_CompiledManifest(json.loads(json.dumps(MANIFEST))))
+    s._swap(ToolCatalog(json.loads(json.dumps(MANIFEST))))
     @s.tool("get_invoice")
     async def handler(ctx, invoice_id, max_results=100):
         return {"invoice_id": invoice_id, "max_results": max_results, "aud": ctx.audience}
@@ -46,14 +46,14 @@ def make_server():
 
 
 def test_compiled_manifest_indexes_views():
-    cm = _CompiledManifest(MANIFEST)
+    cm = ToolCatalog(MANIFEST)
     assert cm.seq == 1 and cm.default_audience == "external"
     assert set(cm.tools["external"]) == {"get_invoice"}
     assert ("internal", "get_invoice") in cm.validators
 
 
 def test_apply_event_is_pure_and_versioned():
-    cm = _CompiledManifest(MANIFEST)
+    cm = ToolCatalog(MANIFEST)
     ev = {"seq": 2, "type": "entity.deleted", "entity": {"type": "tool", "name": "get_invoice"}}
     cm2 = cm.apply(ev)
     assert cm2.seq == 2 and not cm2.tools.get("external")
@@ -84,14 +84,14 @@ def test_audience_entitlement_downgrade():
 
 
 def test_prepare_args_strips_pins_and_validates():
-    s = make_server()
-    view = s._compiled.tools["external"]["get_invoice"]
-    args = s._prepare_args(view, "external", "get_invoice",
+    """Argument preparation is public API now: a caller keeping their own MCP server takes
+    this and nothing else, and it is the half they would otherwise get wrong."""
+    catalog = ToolCatalog(MANIFEST)
+    args = catalog.prepare("get_invoice", "external",
                            {"invoice_id": "i1", "max_results": 999, "evil": 1})
     assert args == {"invoice_id": "i1", "max_results": 25}   # stripped + pin wins
-    from yourco_mcp.server import _McpFailure
-    with pytest.raises(_McpFailure):
-        s._prepare_args(view, "external", "get_invoice", {})  # missing required
+    with pytest.raises(InvalidArguments):
+        catalog.prepare("get_invoice", "external", {})       # missing required
 
 
 def test_auth_policies_and_scopes():
@@ -134,7 +134,7 @@ def test_per_tool_public_execution():
                   "spec": {"name": "locked_public", "description": "Public but admin-scoped.",
                            "auth": {"required_scopes": ["x:y"]},
                            "input_schema": {"type": "object", "properties": {}}}}}})
-    s._swap(_CompiledManifest(m))
+    s._swap(ToolCatalog(m))
 
     @s.tool("get_invoice")                       # default: auth required
     async def gi(ctx, invoice_id, max_results=100): return {"ok": 1}
@@ -185,7 +185,7 @@ def test_code_declared_scopes_union_with_registry():
         "full": {"id": "u2", "scopes": ["code:scope", "registry:scope"]}}))
     m = json.loads(json.dumps(MANIFEST))
     m["entities"][0]["views"]["external"]["spec"]["auth"] = {"required_scopes": ["registry:scope"]}
-    s._swap(_CompiledManifest(m))
+    s._swap(ToolCatalog(m))
 
     @s.tool("get_invoice", scopes=["code:scope"])
     async def gi(ctx, invoice_id, max_results=100): return {"ok": True}
@@ -227,7 +227,7 @@ def test_pubsub_failure_falls_back_to_polling():
 
     client.subscribe = dead_subscription
     s = ProductServer("http://x", "billing", "k", auth=NoAuth(), client=client)
-    s._swap(_CompiledManifest(MANIFEST))
+    s._swap(ToolCatalog(MANIFEST))
 
     @s.tool("get_invoice")
     async def gi(ctx, invoice_id, max_results=100): return {}
